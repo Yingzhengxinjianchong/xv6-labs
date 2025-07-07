@@ -6,7 +6,7 @@ int main(int argc, char *argv[])
 {
   // print error message if user forgets to pass the argument.
   if(argc<=1){
-     printf("Error: no argument. You should use as 'sleep ticks'.\n");
+     fprintf(2,"Error: no argument. You should use as 'sleep ticks'.\n");
      exit(1);
   }
 

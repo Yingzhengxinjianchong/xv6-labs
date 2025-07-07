@@ -21,7 +21,7 @@ int main(int argc, char *argv[])
      // send number 2 to 280.
      for (int i = 2; i <= 280; i++) {
          if (write(p[1], &i, sizeof(i)) != sizeof(i)) {
-            printf("primes: write error\n");
+            fprintf(2, "primes: write error\n");
             exit(1);
          }
      }
@@ -68,7 +68,7 @@ void sieve(int left_pipe[2])
      while (read(left_pipe[0], &num, sizeof(num)) != 0) {
            if (num % prime != 0) {
               if (write(right_pipe[1], &num, sizeof(num)) != sizeof(num)) {
-                 printf("primes: write error\n");
+                 fprintf(2, "primes: write error\n");
                  exit(1);
               }
            }

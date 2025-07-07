@@ -25,14 +25,14 @@ int main(int argc, char *argv[])
 
      // read.
      if (read(p_to_c[0], &received_byte, 1) != 1) {
-        printf("child: read error\n");
+        fprintf(2, "child: read error\n");
         exit(1);
      }
      printf("%d: received ping\n", getpid());
 
      // write.
      if (write(c_to_p[1], &received_byte, 1) != 1) {
-        printf("child: write error\n");
+        fprintf(2, "child: write error\n");
         exit(1);
      }
 
@@ -49,13 +49,13 @@ int main(int argc, char *argv[])
 
      // write.
      if (write(p_to_c[1], &byte_to_send, 1) != 1) {
-        printf("parent: write error\n");
+        fprintf(2, "parent: write error\n");
         exit(1);
      }
 
      // read.
      if (read(c_to_p[0], &received_byte, 1) != 1) {
-        printf("parent: read error\n");
+        fprintf(2, "parent: read error\n");
         exit(1);
      }
      printf("%d: received pong\n", getpid());
