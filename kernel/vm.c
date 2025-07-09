@@ -489,12 +489,42 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 
 #ifdef LAB_PGTBL
 void
+_vmprint_recursive_(pagetable_t pagetable, int level, uint64 va_base)
+{
+  if(level > 2) return; // There are only 3 levels in RISC-V
+
+  // there are 2^9 =512 PTEs in a page table.
+  for(int i = 0; i < 512; i++) {
+     pte_t pte = pagetable[i];
+     if(pte & PTE_V) {
+       // valid PTE.
+       if(PTE_LEAF(pte)) {
+         for(int j = 0; j <= level; j++) {
+            printf(".. ");
+         }
+         // virtual address.
+         uint64 va = va_base + ((uint64)i << PXSHIFT(2 - level));
+         // physical address.
+         uint64 pa = PTE2PA(pte);
+
+         printf("%p: pte %p pa %p\n", (void*)va, (void*)pte, (void*)pa);
+       }
+       else {
+          uint64 next_va_base = va_base + ((uint64)i << PXSHIFT(2 - level));
+          uint64 child_pa = PTE2PA(pte);
+          pagetable_t child = (pagetable_t)(child_pa);
+          _vmprint_recursive_(child, level + 1, next_va_base);
+       }
+     }
+  }
+}
+void
 vmprint(pagetable_t pagetable) {
   // your code here
+  printf("page table %p\n", pagetable);
+  _vmprint_recursive_(pagetable, 0, 0);
 }
 #endif
-
-
 
 #ifdef LAB_PGTBL
 pte_t*
