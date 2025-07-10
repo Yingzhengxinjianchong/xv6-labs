@@ -284,8 +284,27 @@ growproc(int n)
   struct proc *p = myproc();
 
   sz = p->sz;
+  uint64 oldsz = sz;
+  uint64 newsz = SUPERPGROUNDUP(sz);
+  int spgnum = n / SUPERPGSIZE;
+
   if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
+    if(spgnum > 0 && sz < newsz){
+      if((newsz = uvmalloc(p->pagetable, sz, newsz, PTE_W)) == 0) {
+        return -1;
+      }
+      sz = newsz;
+      // update p->sz
+      p->sz = sz;
+    }
+    if (spgnum > 0 && spgnum < 5){
+      if ((newsz = uvmalloc_super(p->pagetable, sz, sz + spgnum * SUPERPGSIZE, PTE_W)) == 0) {
+        return -1;
+      }
+      sz = newsz;
+      p->sz = sz;
+    }
+    if((sz = uvmalloc(p->pagetable, sz, oldsz + n, PTE_W)) == 0) {
       return -1;
     }
   } else if(n < 0){
