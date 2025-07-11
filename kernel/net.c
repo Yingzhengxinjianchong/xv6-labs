@@ -19,6 +19,41 @@ static uint8 host_mac[ETHADDR_LEN] = { 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 };
 
 static struct spinlock netlock;
 
+// A structure to hold a received packet's essential, parsed information.
+struct queued_packet {
+  uint32 src_ip;
+  uint16 src_port;
+  char *payload; // a new, smaller buffer holding only the UDP payload
+  int len;       // length of the payload
+};
+
+// a queue of packets, and a place for a process to sleep
+#define MAX_UDP_PACKETS 16
+struct sock {
+  int valid;                    // 1 if this socket in use, 0 otherwise.
+  int port;                     // UDP port number
+  struct proc *proc;            // which process is waiting on this socket
+  struct spinlock lock;
+  struct queued_packet *packets[MAX_UDP_PACKETS];
+  int r_idx;                      // read index for the queue
+  int w_idx;                      // write index for the queue
+  int len;                        // number of packets in the queue
+};
+
+static struct sock sockets[NPROC];
+
+static struct sock *
+find_sock(int port)
+{
+  struct sock *s;
+  for(s = sockets; s < &sockets[NPROC]; s++){
+    if(s->valid == 1 && s->port == port) {
+      return s;
+    }
+  }
+  return 0;
+}
+
 void
 netinit(void)
 {
@@ -37,8 +72,40 @@ sys_bind(void)
   //
   // Your code here.
   //
+  struct proc *p = myproc();
+  int port;
+  struct sock *s = 0;
 
-  return -1;
+  // Fetch the port number argument from the user process.
+  argint(0, &port);
+  // Acquire the lock to safely access the shared sockets array.
+  acquire(&netlock);
+
+  // Look for an unused socket.
+  for(int i = 0; i < NPROC; i++){
+    if(sockets[i].valid == 0){
+      s = &sockets[i];
+      break;
+    }
+  }
+
+  if(s == 0){
+    release(&netlock);
+    return -1;
+  }
+
+  // Initialize the found socket.
+  s->valid = 1;
+  s->port = port;
+  s->proc = p; // Associate this socket with the current process.
+  s->r_idx = 0;
+  s->w_idx = 0;
+  s->len = 0;
+  initlock(&s->lock, "sock");
+
+  release(&netlock);
+
+  return 0;
 }
 
 //
@@ -77,7 +144,69 @@ sys_recv(void)
   //
   // Your code here.
   //
-  return -1;
+  struct proc *p = myproc();
+  int port;
+  uint64 src_addr, sport_addr, buf_addr;
+  int maxlen;
+  struct sock *s = 0;
+  struct queued_packet *qp;
+
+  // Fetch all the arguments from the user process.
+  argint(0, &port);
+  argaddr(1, &src_addr);
+  argaddr(2, &sport_addr);
+  argaddr(3, &buf_addr);
+  argint(4, &maxlen);
+
+  // Find the socket that the user wants to receive from.
+  acquire(&netlock);
+
+  s = find_sock(port);
+  if(s == 0){
+    release(&netlock);
+    return -1;
+  }
+
+  // Switch the locks.
+  acquire(&s->lock);
+  release(&netlock);
+
+  // sleep/wakeup loop
+  while(s->len == 0){
+    // Atomically releases the lock, puts the process to sleep,
+    // and re-acquires the lock upon wakeup.
+    if(p->killed) {
+      release(&s->lock);
+      return -1;
+    }
+    sleep(s, &s->lock);
+  }
+
+  // Dequeue one packet.
+  qp = s->packets[s->r_idx];
+  s->r_idx = (s->r_idx + 1) % MAX_UDP_PACKETS;
+  s->len--;
+
+  release(&s->lock);
+
+  int copy_len = qp->len;
+  if(copy_len > maxlen)
+    copy_len = maxlen;
+
+  // Copy address, port and data;
+  if(copyout(p->pagetable, src_addr, (char*)&qp->src_ip, sizeof(qp->src_ip)) < 0 ||
+     copyout(p->pagetable, sport_addr, (char*)&qp->src_port, sizeof(qp->src_port)) < 0 ||
+     copyout(p->pagetable, buf_addr, qp->payload, copy_len) < 0) {
+     if(qp->payload)
+       kfree(qp->payload);
+     kfree(qp);
+     return -1;
+  }
+
+  if(qp->payload)
+    kfree(qp->payload); // Free the payload buffer.
+  kfree(qp);          // Free the queued_packet struct itself.
+  return copy_len;
 }
 
 // This code is lifted from FreeBSD's ping.c, and is copyright by the Regents
@@ -191,7 +320,83 @@ ip_rx(char *buf, int len)
   //
   // Your code here.
   //
-  
+  // Parse the IP header.
+  struct eth *eth = (struct eth *) buf;
+  struct ip *ip = (struct ip *) (eth + 1);
+  struct udp *udp = (struct udp *) (ip + 1);
+
+  int udp_len = ntohs(udp->ulen);
+  if(udp_len < sizeof(struct udp) || len < sizeof(struct eth) + sizeof(struct ip) + udp_len)
+    return;
+
+  // Check if it's a UDP packet. If not, free the buffer and return.
+  if(ip->ip_p != IPPROTO_UDP){
+    kfree(buf);
+    return;
+  }
+
+  int port = ntohs(udp->dport);
+
+  // Find the listening socket.
+  acquire(&netlock);
+  struct sock *s = find_sock(port);
+  if(s == 0){
+    kfree(buf);
+    release(&netlock);
+    return;
+  }
+
+  // Switch the locks.
+  acquire(&s->lock);
+  release(&netlock);
+
+  // If no socket found, or the found socket's queue is full, drop the packet.
+  if(s >= &sockets[NPROC] || s->len >= MAX_UDP_PACKETS){
+    kfree(buf);
+    release(&s->lock);
+    return;
+  }
+
+  // Allocate a small struct to hold parsed packet info.
+  struct queued_packet *qp = kalloc();
+  if(qp == 0){
+    kfree(buf);
+    release(&s->lock);
+    return;
+  }
+
+  int payload_len = ntohs(udp->ulen) - sizeof(struct udp);
+  // Allocate a small buffer just for the payload.
+  char *payload_buf = kalloc();
+  if(payload_buf == 0){
+    kfree(qp); // must free the qp we just allocated
+    kfree(buf);
+    release(&s->lock);
+    return;
+  }
+
+  // Copy only the payload from the large driver buffer.
+  memmove(payload_buf, (char*)(udp + 1), payload_len);
+  memset(qp, 0, sizeof(*qp));
+
+  // Fill in the parsed info.
+  qp->src_ip = ntohl(ip->ip_src);
+  qp->src_port = ntohs(udp->sport);
+  qp->payload = payload_buf;
+  qp->len = payload_len;
+
+  // Enqueue the small, parsed packet struct.
+  s->packets[s->w_idx] = qp;
+  s->w_idx = (s->w_idx + 1) % MAX_UDP_PACKETS;
+  s->len++;
+
+  // Wake up the process that might be sleeping, waiting for this packet.
+  if(s->proc)
+    wakeup(s);
+
+  kfree(buf);
+
+  release(&s->lock);
 }
 
 //

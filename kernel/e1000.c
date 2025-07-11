@@ -107,6 +107,7 @@ e1000_transmit(char *buf, int len)
   // If it's not set, the NIC is still busy with this descriptor,
   // which means the ring is full
   if(!(tx_ring[index].status & E1000_TXD_STAT_DD)){
+    release(&e1000_lock);
     return -1; // Return an error if the ring is full.
   }
 
