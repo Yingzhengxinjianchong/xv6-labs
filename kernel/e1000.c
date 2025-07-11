@@ -101,8 +101,26 @@ e1000_transmit(char *buf, int len)
   // the TX descriptor ring so that the e1000 sends it. Stash
   // a pointer so that it can be freed after send completes.
   //
+  acquire(&e1000_lock);
+  int index = regs[E1000_TDT];
 
-  
+  // If it's not set, the NIC is still busy with this descriptor,
+  // which means the ring is full
+  if(!(tx_ring[index].status & E1000_TXD_STAT_DD)){
+    return -1; // Return an error if the ring is full.
+  }
+
+  if(tx_bufs[index])
+    kfree(tx_bufs[index]);
+
+  tx_bufs[index] = buf;
+  tx_ring[index].addr = (uint64)buf;
+  tx_ring[index].length = len;
+  tx_ring[index].cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS;
+  tx_ring[index].status = 0;
+
+  regs[E1000_TDT] = (index + 1) % TX_RING_SIZE;
+  release(&e1000_lock);
   return 0;
 }
 
@@ -115,7 +133,29 @@ e1000_recv(void)
   // Check for packets that have arrived from the e1000
   // Create and deliver a buf for each packet (using net_rx()).
   //
+  while(1) {
+    int index = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
 
+    if (!(rx_ring[index].status & E1000_RXD_STAT_DD)) {
+      // No more packets to process.
+      return;
+    }
+
+    if (rx_ring[index].status & E1000_RXD_STAT_EOP) {
+       // it is a complete packet.
+       int len = rx_ring[index].length;
+
+       net_rx(rx_bufs[index], len);
+
+       rx_bufs[index] = kalloc();
+       if (!rx_bufs[index])
+         panic("e1000_recv: kalloc failed");
+
+       rx_ring[index].addr = (uint64)rx_bufs[index];
+       rx_ring[index].status = 0; // Clear status for the NIC
+    }
+    regs[E1000_RDT] = index;
+  }
 }
 
 void
