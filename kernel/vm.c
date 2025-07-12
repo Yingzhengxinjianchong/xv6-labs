@@ -315,20 +315,33 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
+
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+    // If the page is writeable, mark it as copy-on-write in both parent and child.
+    // Otherwise, share it as read-only.
+    if(flags & PTE_W) {
+      // Clear PTE_W and set PTE_COW in parent's PTE.
+      *pte = (*pte & ~PTE_W) | PTE_COW;
+
+      // The new flags for child's mapping will also be read-only and COW.
+      flags = (flags & ~PTE_W) | PTE_COW;
+    }
+
+    // Increment the reference count for the shared physical page.
+    add_ref((void*)pa);
+
+    // Map the page into the child's page table.
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+      // If mappages fails, the ref count we just added is now orphaned.
+      // We must decrement it before cleaning up.
+      kfree((void*)pa);
       goto err;
     }
   }
@@ -345,7 +358,7 @@ void
 uvmclear(pagetable_t pagetable, uint64 va)
 {
   pte_t *pte;
-  
+
   pte = walk(pagetable, va, 0);
   if(pte == 0)
     panic("uvmclear");
@@ -365,10 +378,30 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     va0 = PGROUNDDOWN(dstva);
     if(va0 >= MAXVA)
       return -1;
+
     pte = walk(pagetable, va0, 0);
-    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ||
-       (*pte & PTE_W) == 0)
-      return -1;
+
+    // If page is not writeable, check if it's a COW page.
+    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
+      return -1; // Invalid mapping
+
+    if((*pte & PTE_W) == 0) {
+      if((*pte & PTE_COW) == 0) {
+        return -1; // Not a COW page, so it's a true read-only page. Error.
+      }
+      // It is a COW page. Handle the fault.
+      char* mem;
+      if((mem = kalloc()) == 0) {
+        return -1;
+      }
+      uint64 pa = PTE2PA(*pte);
+      uint flags = PTE_FLAGS(*pte);
+      memmove(mem, (char*)pa, PGSIZE);
+      kfree((void*)pa);
+      *pte = PA2PTE((uint64)mem) | (flags & ~PTE_COW) | PTE_W;
+    }
+    // By this point, the page is guaranteed to be writeable.
+
     pa0 = PTE2PA(*pte);
     n = PGSIZE - (dstva - va0);
     if(n > len)
