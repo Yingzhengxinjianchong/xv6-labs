@@ -16,6 +16,8 @@
 #include "file.h"
 #include "fcntl.h"
 
+#define MAX_SYMLINK_DEPTH 10
+
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
 static int
@@ -328,6 +330,40 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
+
+    // -- symlinks --
+    int depth = 0;
+    // Follow symbolic links, unless O_NOFOLLOW is specified.
+    while(ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)) {
+      // Check for symbolic link cycle.
+      if(depth++ >= MAX_SYMLINK_DEPTH) {
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+
+      // Read the target path from the link's content.
+      char target_path[MAXPATH];
+      if(readi(ip, 0, (uint64)target_path, 0, ip->size) != ip->size) {
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+      // Null-terminate the path.
+      target_path[ip->size] = '\0';
+
+      // Release the current symlink inode.
+      iunlockput(ip);
+
+      // Resolve the new path.
+      if((ip = namei(target_path)) == 0) {
+        end_op();
+        return -1;
+      }
+      // Lock the new inode to check its type in the next loop iteration.
+      ilock(ip);
+    }
+
     if(ip->type == T_DIR && omode != O_RDONLY){
       iunlockput(ip);
       end_op();
@@ -501,5 +537,44 @@ sys_pipe(void)
     fileclose(wf);
     return -1;
   }
+  return 0;
+}
+
+uint64
+sys_symlink(void)
+{
+  char path[MAXPATH], target[MAXPATH];
+  struct inode *ip;
+
+  // Fetch the two string arguments: target and path.
+  argstr(0, target, MAXPATH);
+  argstr(1, path, MAXPATH);
+
+  begin_op();
+  // Create a new inode with the type T_SYMLINK.
+  ip = create(path, T_SYMLINK, 0, 0);
+  if(ip == 0){
+    end_op();
+    return -1;
+  }
+
+  // ip is returned locked. Write the target path into the inode's data blocks.
+  // The content of a symlink file is the path of the file it points to.
+  int target_len = strlen(target);
+  if(writei(ip, 0, (uint64)target, 0, target_len) != target_len) {
+    // If write fails, clean up the created inode.
+    // Setting nlink to 0 and then putting it will cause it to be freed.
+    ip->nlink = 0;
+    iupdate(ip);
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+
+  // Unlock and put the inode.
+  iunlockput(ip);
+
+  end_op();
+
   return 0;
 }
